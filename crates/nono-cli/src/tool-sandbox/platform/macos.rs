@@ -3739,10 +3739,14 @@ fn add_policy_network(caps: &mut CapabilitySet, policy: &CommandSandboxConfig) -
     };
     // Localhost bind grants (e.g. an OAuth callback listener) flow to the child
     // via localhost_port_ranges → proxy_bind_port_ranges, so they compose with
-    // ProxyOnly mode. Only ranges are carried in the child spec, so singles are
-    // widened to [port, port].
+    // ProxyOnly mode. Preserve macOS port 0 as a single wildcard capability;
+    // zero is not a valid range endpoint. Other singles retain their range form.
     for &port in &network.open_port {
-        caps.add_localhost_port_range(port, port)?;
+        if port == 0 {
+            caps.add_localhost_port(port);
+        } else {
+            caps.add_localhost_port_range(port, port)?;
+        }
     }
     for &[start, end] in &network.open_port_range {
         caps.add_localhost_port_range(start, end)?;
@@ -4528,6 +4532,7 @@ fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
             _ => Vec::new(),
         },
         proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        localhost_ports: caps.localhost_ports().to_vec(),
         tcp_connect_ports: caps.tcp_connect_ports().to_vec(),
         tcp_bind_ports: caps.tcp_bind_ports().to_vec(),
     }
@@ -4545,6 +4550,9 @@ fn caps_from_spec(spec: &ChildCapsSpec) -> Result<CapabilitySet> {
     }
     for &(start, end) in &spec.proxy_bind_port_ranges {
         caps.add_localhost_port_range(start, end)?;
+    }
+    for &port in &spec.localhost_ports {
+        caps.add_localhost_port(port);
     }
     for fs_grant in &spec.fs {
         caps.add_fs(fs_cap_from_spec(fs_grant)?);
@@ -7127,6 +7135,7 @@ mod tests {
             proxy_port: None,
             proxy_bind_ports: Vec::new(),
             proxy_bind_port_ranges: Vec::new(),
+            localhost_ports: Vec::new(),
             tcp_connect_ports: Vec::new(),
             tcp_bind_ports: Vec::new(),
         };
@@ -9040,6 +9049,39 @@ mod tests {
         let selected = select_effective_policy(&config, "git", &Caller::Session)?;
 
         assert_eq!(selected.fs_read, sandbox.fs_read);
+        Ok(())
+    }
+
+    #[test]
+    fn compat_open_port_zero_survives_child_spec_roundtrip() -> Result<()> {
+        let policy = CommandSandboxConfig {
+            network: Some(crate::command_policy::CommandNetworkConfig {
+                open_port: vec![0, 8250],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut caps = CapabilitySet::new();
+        add_policy_network(&mut caps, &policy)?;
+        caps.set_network_mode_mut(NetworkMode::ProxyOnly {
+            port: 8080,
+            bind_ports: vec![],
+        });
+        let wire = serde_json::to_vec(&caps_to_spec(&caps)).expect("encode child caps");
+        let spec = serde_json::from_slice(&wire).expect("decode child caps");
+        let restored = caps_from_spec(&spec)?;
+        assert_eq!(restored.localhost_ports(), &[0]);
+        assert_eq!(restored.localhost_port_ranges(), &[(8250, 8250)]);
+        assert_eq!(restored.network_mode(), caps.network_mode());
+        // Missing optional field must never imply wildcard access.
+        let mut old_wire =
+            serde_json::to_value(caps_to_spec(&CapabilitySet::new())).expect("encode");
+        old_wire
+            .as_object_mut()
+            .expect("object")
+            .remove("localhost_ports");
+        let old_spec = serde_json::from_value(old_wire).expect("decode old child caps");
+        assert!(caps_from_spec(&old_spec)?.localhost_ports().is_empty());
         Ok(())
     }
 
