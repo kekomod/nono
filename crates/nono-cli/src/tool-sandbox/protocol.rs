@@ -110,6 +110,9 @@ pub(crate) struct ChildCapsSpec {
     pub(crate) proxy_bind_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) proxy_bind_port_ranges: Vec<(u16, u16)>,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) localhost_ports: Vec<u16>,
     pub(crate) tcp_connect_ports: Vec<u16>,
     pub(crate) tcp_bind_ports: Vec<u16>,
 }
