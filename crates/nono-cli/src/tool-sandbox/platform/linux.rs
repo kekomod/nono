@@ -2210,19 +2210,7 @@ fn run_with_timeout<F>(timeout: std::time::Duration, f: F) -> Result<nono::Appro
 where
     F: FnOnce() -> Result<nono::ApprovalDecision> + Send + 'static,
 {
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = f();
-        // Ignore send error: receiver may have dropped on timeout.
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Ok(nono::ApprovalDecision::Timeout),
-    }
+    crate::approval_terminal_handoff::run_with_timeout(timeout, f)
 }
 
 fn parent_pid(pid: u32) -> Result<u32> {

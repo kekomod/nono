@@ -4,6 +4,7 @@
 
 mod app_runtime;
 mod approval_runtime;
+mod approval_terminal_handoff;
 mod audit_attestation;
 mod audit_client;
 mod audit_commands;

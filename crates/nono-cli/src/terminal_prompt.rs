@@ -1,7 +1,9 @@
 //! Guarded terminal input for security-sensitive line prompts.
 
+use nix::libc;
 use nono::{NonoError, Result};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 const CONSENT_INPUT_DELAY: Duration = Duration::from_secs(1);
@@ -39,18 +41,87 @@ fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration)
 
     write!(tty, "Input enables in 1 second · early keys ignored").map_err(NonoError::Io)?;
     tty.flush().map_err(NonoError::Io)?;
-    std::thread::sleep(delay);
+    let enables = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < enables {
+        check_cancelled()?;
+        std::thread::sleep(
+            Duration::from_millis(20)
+                .min(enables.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    check_cancelled()?;
 
     nix::sys::termios::tcflush(&tty, nix::sys::termios::FlushArg::TCIFLUSH)
         .map_err(termios_error)?;
     write!(tty, "\r\x1b[2K{prompt}").map_err(NonoError::Io)?;
     tty.flush().map_err(NonoError::Io)?;
 
-    let mut input = String::new();
-    std::io::BufReader::new(tty)
-        .read_line(&mut input)
-        .map_err(NonoError::Io)?;
-    Ok(input)
+    let mut input = Vec::new();
+    loop {
+        check_cancelled()?;
+        // select supports the macOS controlling-terminal device, which rejects poll.
+        let fd = tty.as_raw_fd();
+        if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+            return Err(NonoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Approval terminal descriptor exceeds select limit",
+            )));
+        }
+        // SAFETY: fd is owned by tty and checked against fd_set's fixed capacity.
+        let ready = unsafe {
+            let mut readable: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut readable);
+            libc::FD_SET(fd, &mut readable);
+            let mut timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 50_000,
+            };
+            libc::select(
+                fd + 1,
+                &mut readable,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(NonoError::Io(error));
+        }
+        if ready == 0 {
+            continue;
+        }
+        check_cancelled()?;
+        let mut byte = [0];
+        if tty.read(&mut byte).map_err(NonoError::Io)? == 0 {
+            break;
+        }
+        input.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+        if input.len() > 4096 {
+            return Err(NonoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Approval response too long",
+            )));
+        }
+    }
+    check_cancelled()?;
+    Ok(String::from_utf8_lossy(&input).into_owned())
+}
+
+fn check_cancelled() -> Result<()> {
+    if crate::approval_terminal_handoff::cancelled() {
+        return Err(NonoError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Approval cancelled or expired",
+        )));
+    }
+    Ok(())
 }
 
 fn termios_error(error: nix::errno::Errno) -> NonoError {
@@ -108,6 +179,39 @@ impl Drop for TermiosRestoreGuard {
 mod tests {
     use super::*;
     use nix::pty::{OpenptyResult, openpty};
+
+    #[test]
+    fn compat_terminal_timeout_stops_reader_and_restores_line_settings() {
+        let OpenptyResult {
+            master: _master,
+            slave,
+        } = openpty(None, None).expect("openpty");
+        let original = nix::sys::termios::tcgetattr(&slave).expect("original termios");
+        let reader = nix::unistd::dup(&slave).expect("reader fd");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let decision = crate::approval_terminal_handoff::run_with_timeout(
+            Duration::from_millis(50),
+            move || {
+                let result = read_consent_line_from(
+                    std::fs::File::from(reader),
+                    "Continue? ",
+                    Duration::ZERO,
+                );
+                assert!(result.is_err());
+                sender.send(()).expect("reader returned");
+                Ok(nono::ApprovalDecision::Timeout)
+            },
+        )
+        .expect("deadline result");
+        assert!(!decision.is_granted());
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("no orphan reader");
+        assert_eq!(
+            nix::sys::termios::tcgetattr(&slave).expect("restored termios"),
+            original
+        );
+    }
 
     #[test]
     fn consent_reader_discards_early_input_and_accepts_fresh_response() {

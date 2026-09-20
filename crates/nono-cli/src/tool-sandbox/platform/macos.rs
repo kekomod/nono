@@ -4783,16 +4783,7 @@ fn run_with_timeout<F>(timeout: std::time::Duration, f: F) -> Result<nono::Appro
 where
     F: FnOnce() -> Result<nono::ApprovalDecision> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Ok(nono::ApprovalDecision::Denied {
-            reason: "approval timeout".to_string(),
-        }),
-    }
+    crate::approval_terminal_handoff::run_with_timeout(timeout, f)
 }
 
 // ── Audit ─────────────────────────────────────────────────────────────────

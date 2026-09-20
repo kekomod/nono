@@ -16,6 +16,12 @@ pub struct TerminalApproval;
 
 impl ApprovalBackend for TerminalApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        if let Some(result) = crate::approval_terminal_handoff::request(request) {
+            return result;
+        }
+        if crate::approval_terminal_handoff::cancelled() {
+            return Ok(ApprovalDecision::Timeout);
+        }
         // Check the controlling terminal itself, in the same read/write mode
         // used to prompt, so we don't print a prompt we cannot safely answer.
         if !crate::terminal_prompt::consent_prompt_available() {
