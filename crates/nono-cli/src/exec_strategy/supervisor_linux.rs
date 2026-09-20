@@ -733,7 +733,8 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    (addrlen == 2) have no path to check.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
-///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
+///    - `connect()` and addressed sends allow the proxy and explicitly granted
+///      localhost ports/ranges, on loopback only. Bind-only grants stay bind-only.
 ///    - `bind()` is allowed on ports in `proxy_bind_ports` or within any range in `proxy_bind_port_ranges`.
 ///    - Everything else is denied.
 pub(super) fn decide_network_notification(
@@ -786,10 +787,14 @@ pub(super) fn decide_network_notification(
 
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
+            // Honor explicit localhost grants as well as the proxy listener (#1786).
             // sendto/sendmsg/sendmmsg with a destination address is semantically
             // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
+            let declared_localhost = config
+                .proxy_bind_port_ranges
+                .iter()
+                .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
+            if sockaddr.is_loopback && (sockaddr.port == config.proxy_port || declared_localhost) {
                 debug!(
                     "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
                     syscall, sockaddr.port
@@ -2483,6 +2488,40 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49201), &config),
                 NetworkDecision::Deny
             );
+        }
+
+        #[test]
+        fn compat_declared_loopback_ports_allow_connect_and_addressed_sends() {
+            let backend = DenyAllBackend;
+            let config =
+                make_config_with_ranges(&backend, 8080, vec![9000], vec![(8250, 8255)], &[]);
+            for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                for family in [libc::AF_INET as u16, libc::AF_INET6 as u16] {
+                    for port in [8080, 8250, 8253, 8255] {
+                        let mut address = inet_loopback(port);
+                        address.family = family;
+                        assert_eq!(
+                            decide_network_notification(test_pid(), syscall, &address, &config),
+                            NetworkDecision::Allow,
+                        );
+                    }
+                    // No widening to undeclared ports, bind-only grants or remote IPs.
+                    for port in [8249, 8256, 9000] {
+                        let mut address = inet_loopback(port);
+                        address.family = family;
+                        assert_eq!(
+                            decide_network_notification(test_pid(), syscall, &address, &config),
+                            NetworkDecision::Deny,
+                        );
+                    }
+                    let mut address = inet_external(8250);
+                    address.family = family;
+                    assert_eq!(
+                        decide_network_notification(test_pid(), syscall, &address, &config),
+                        NetworkDecision::Deny,
+                    );
+                }
+            }
         }
 
         #[test]
