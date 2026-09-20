@@ -1205,14 +1205,6 @@ fn handle_received_network_notification(
         return Ok(());
     }
 
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
     // TOCTOU check
     if !notif_id_valid(notify_fd, notif.id)? {
         debug!("Network seccomp notification expired (TOCTOU check)");
@@ -1223,10 +1215,20 @@ fn handle_received_network_notification(
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
             NetworkDecision::Deny => {
-                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                // Policy is authoritative even when the reporting budget is empty.
+                // Allowed traffic must never spend the approval-prompt budget (#1420).
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-                if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
-                    warn!("Failed to record network denial audit event: {}", err);
+                if rate_limiter.try_acquire() {
+                    record_af_unix_ipc_denial(
+                        sockaddr,
+                        notif.pid,
+                        notif.data.nr,
+                        denials,
+                        ipc_denials,
+                    );
+                    if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
+                        warn!("Failed to record network denial audit event: {}", err);
+                    }
                 }
                 return Ok(());
             }
