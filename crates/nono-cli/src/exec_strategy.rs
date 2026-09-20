@@ -2756,13 +2756,19 @@ type SupervisorLoopResult = (
 /// Reap descendants that reparented onto this supervisor (a child-subreaper),
 /// so short-lived detached processes don't linger as zombies for the session.
 ///
-/// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
-/// never consumed. If the primary `child` is reaped here, its status is
+/// `waitpid(-1, WNOHANG | __WNOTHREAD)` returns only terminated children owned
+/// by this Linux thread, so a live child is never consumed and a worker's
+/// command cannot be stolen by the supervisor. Reparented children are adopted
+/// by the supervisor's group leader and remain collectable here after their
+/// creating worker exits. If the primary `child` is reaped here, its status is
 /// returned rather than dropped.
 #[cfg(target_os = "linux")]
 fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
     loop {
-        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(
+            Some(Pid::from_raw(-1)),
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WNOTHREAD),
+        ) {
             Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
                 if pid == child {
                     return Some(status);
@@ -4491,6 +4497,250 @@ mod tests {
         assert!(!should_suppress_diagnostics_for_tool_sandbox_denial(
             0, false
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_reaper_isolated_thread_ownership_and_adoption() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        const CHILD_FIXTURE_ENV: &str = "NONO_COMPAT_WAIT_STATUS_FIXTURE";
+
+        if std::env::var_os(CHILD_FIXTURE_ENV).is_none() {
+            let status = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "exec_strategy::tests::test_linux_reaper_isolated_thread_ownership_and_adoption",
+                    "--nocapture",
+                ])
+                .env(CHILD_FIXTURE_ENV, "1")
+                .status()
+                .expect("isolated wait-status fixture");
+            assert!(
+                status.success(),
+                "isolated wait-status fixture failed: {status}"
+            );
+            return;
+        }
+
+        // libtest invokes this function on a worker thread. Fork once before
+        // creating any descendants so the fixture itself runs in a fresh
+        // one-thread process whose PID is also the thread-group leader, as it
+        // is for the real supervisor. The worker only waits for that process.
+        match unsafe { fork() }.expect("fork main-thread fixture") {
+            ForkResult::Parent { child } => {
+                let status =
+                    waitpid(child, Some(WaitPidFlag::empty())).expect("main-thread fixture status");
+                assert!(
+                    matches!(status, WaitStatus::Exited(pid, 0) if pid == child),
+                    "main-thread fixture failed: {status:?}"
+                );
+                return;
+            }
+            ForkResult::Child => {}
+        }
+
+        // This fixture owns all process-wide wait state in a disposable test
+        // process. The supervisor normally enables this before spawning tool
+        // descendants, so adopted grandchildren remain ours to reap.
+        let subreaper = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        assert_eq!(subreaper, 0, "set child subreaper");
+
+        fn fork_exit(code: i32) -> Pid {
+            // SAFETY: Both fork children immediately call async-signal-safe _exit.
+            match unsafe { fork() }.expect("fork exit child") {
+                ForkResult::Parent { child } => child,
+                ForkResult::Child => unsafe { libc::_exit(code) },
+            }
+        }
+
+        fn wait_without_reaping(pid: Pid) {
+            loop {
+                // SAFETY: `info` is an initialized output buffer and WNOWAIT
+                // observes the child without consuming the wait status.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid.as_raw() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(result, 0, "waitid({pid}) failed");
+                // SAFETY: waitid initialized si_pid on a successful observation.
+                if unsafe { info.si_pid() } == pid.as_raw() {
+                    return;
+                }
+                thread::yield_now();
+            }
+        }
+
+        fn fork_adopted(outer_code: i32, inner_code: i32) -> (Pid, Pid) {
+            let mut pipe_fds = [0; 2];
+            // SAFETY: `pipe_fds` is a valid two-element output buffer.
+            assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe");
+            let outer = {
+                // SAFETY: The child performs only raw fd operations and _exit.
+                match unsafe { fork() }.expect("fork adopting child") {
+                    ForkResult::Parent { child } => child,
+                    ForkResult::Child => {
+                        unsafe { libc::close(pipe_fds[0]) };
+                        let inner = match unsafe { fork() }.expect("fork adopted grandchild") {
+                            ForkResult::Parent { child } => child,
+                            ForkResult::Child => unsafe { libc::_exit(inner_code) },
+                        };
+                        let bytes = inner.as_raw().to_ne_bytes();
+                        let written =
+                            unsafe { libc::write(pipe_fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                        unsafe { libc::close(pipe_fds[1]) };
+                        if written != bytes.len() as isize {
+                            unsafe { libc::_exit(127) };
+                        }
+                        unsafe { libc::_exit(outer_code) };
+                    }
+                }
+            };
+            unsafe { libc::close(pipe_fds[1]) };
+            let mut bytes = [0u8; std::mem::size_of::<i32>()];
+            let mut read = 0;
+            while read < bytes.len() {
+                // SAFETY: The destination is the remaining part of our pipe buffer.
+                let count = unsafe {
+                    libc::read(
+                        pipe_fds[0],
+                        bytes[read..].as_mut_ptr().cast(),
+                        bytes.len() - read,
+                    )
+                };
+                assert!(count > 0, "read adopted grandchild pid");
+                read += count as usize;
+            }
+            unsafe { libc::close(pipe_fds[0]) };
+            (outer, Pid::from_raw(i32::from_ne_bytes(bytes)))
+        }
+
+        // An exited child created by a live worker must remain waitable by the
+        // worker while the supervisor collects its own primary child.
+        let (worker_ready_tx, worker_ready_rx) = mpsc::channel();
+        let (worker_release_tx, worker_release_rx) = mpsc::channel();
+        let (worker_status_tx, worker_status_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let owned = fork_exit(23);
+            wait_without_reaping(owned);
+            worker_ready_tx.send(()).expect("worker ready");
+            worker_release_rx.recv().expect("worker release");
+            let status = waitpid(owned, Some(WaitPidFlag::empty())).expect("worker-owned wait");
+            worker_status_tx.send(status).expect("worker status");
+        });
+        worker_ready_rx.recv().expect("worker child exited");
+
+        let primary = fork_exit(17);
+        wait_without_reaping(primary);
+        let primary_status = reap_reparented_orphans(primary);
+        assert!(
+            matches!(primary_status, Some(WaitStatus::Exited(pid, 17)) if pid == primary),
+            "main-thread primary child status was not preserved: {primary_status:?}"
+        );
+        worker_release_tx
+            .send(())
+            .expect("release worker-owned child");
+        worker.join().expect("worker join");
+        assert!(
+            matches!(worker_status_rx.recv().expect("worker status"), WaitStatus::Exited(pid, 23) if pid != primary),
+            "worker must retain ownership of its exited child"
+        );
+
+        // A child-subreaper must still drain a grandchild adopted after its
+        // direct parent exits. Both statuses are observed without reaping so
+        // the native orphan loop is the only code that consumes them.
+        let (adopter, grandchild) = fork_adopted(29, 31);
+        wait_without_reaping(adopter);
+        wait_without_reaping(grandchild);
+        let adopter_status = reap_reparented_orphans(adopter);
+        assert!(
+            matches!(adopter_status, Some(WaitStatus::Exited(pid, 29)) if pid == adopter),
+            "adopted parent status was not returned: {adopter_status:?}"
+        );
+        assert!(
+            reap_reparented_orphans(Pid::from_raw(-1)).is_none(),
+            "adopted grandchild should be drained without being returned as primary"
+        );
+        let mut adopted_grandchild_gone = false;
+        for _ in 0..1000 {
+            if unsafe { libc::kill(grandchild.as_raw(), 0) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                adopted_grandchild_gone = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            adopted_grandchild_gone,
+            "adopted grandchild PID remained present after reaping"
+        );
+
+        // Keep a sibling thread alive while a different worker exits. The
+        // worker's exited child is then reparented to the supervisor and must
+        // remain drainable by the main thread under __WNOTHREAD.
+        let (sibling_ready_tx, sibling_ready_rx) = mpsc::channel();
+        let (sibling_release_tx, sibling_release_rx) = mpsc::channel();
+        let sibling = thread::spawn(move || {
+            sibling_ready_tx.send(()).expect("sibling ready");
+            sibling_release_rx.recv().expect("sibling release");
+        });
+        sibling_ready_rx.recv().expect("sibling alive");
+        let (abandoned_tx, abandoned_rx) = mpsc::channel();
+        let abandoned_worker = thread::spawn(move || {
+            let abandoned = fork_exit(37);
+            wait_without_reaping(abandoned);
+            abandoned_tx.send(abandoned).expect("abandoned child");
+        });
+        let abandoned = abandoned_rx.recv().expect("abandoned child ready");
+        abandoned_worker.join().expect("abandoned worker join");
+        // Poll until the expected child is reparented and consumed. `waitid`
+        // uses WNOWAIT here so this assertion never performs the collection
+        // that belongs to the native orphan reaper.
+        let mut collected = false;
+        for _ in 0..1000 {
+            let _ = reap_reparented_orphans(Pid::from_raw(-1));
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    abandoned.as_raw() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD),
+                    "waitid abandoned child"
+                );
+            }
+            // The worker observed the zombie before exiting. `kill(pid, 0)`
+            // must now report ESRCH, which proves the orphan reaper consumed
+            // it; waitid(si_pid == 0) alone would also describe a live child.
+            let process_exists = unsafe { libc::kill(abandoned.as_raw(), 0) } == 0;
+            if !process_exists
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                collected = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(collected, "abandoned worker child was not collected");
+        sibling_release_tx.send(()).expect("release sibling");
+        sibling.join().expect("sibling join");
+
+        // The leader fixture is a forked test-only process. Do not return
+        // into libtest's copied worker-thread plumbing after the assertions.
+        unsafe { libc::_exit(0) };
     }
 
     #[cfg(target_os = "linux")]
