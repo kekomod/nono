@@ -2220,6 +2220,12 @@ fn close_pause_pipe() {
 }
 
 extern "C" fn forward_signal(sig: libc::c_int) {
+    if matches!(
+        sig,
+        libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
+    ) {
+        crate::approval_terminal_handoff::interrupted();
+    }
     let child_raw = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
     if child_raw > 0 {
         if sig == libc::SIGWINCH {
@@ -2558,6 +2564,7 @@ fn run_supervisor_loop(
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
 ) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
+    let terminal_owner = crate::approval_terminal_handoff::register(child.as_raw());
     // Start the macOS tool-sandbox background listener thread (no-op if tool-sandbox not active).
     #[cfg(target_os = "macos")]
     if let Some(tool_sandbox_runtime) = config.tool_sandbox_runtime
@@ -2579,6 +2586,7 @@ fn run_supervisor_loop(
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
     loop {
+        terminal_owner.service(pty.as_deref_mut());
         let (pty_master, pty_client, pty_attach, pty_resize) =
             pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
         let mut pfds = [
@@ -2850,8 +2858,10 @@ fn run_supervisor_loop(
     let mut ipc_denials = Vec::new();
     let mut sock_fd_active = true;
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
+    let terminal_owner = crate::approval_terminal_handoff::register(child.as_raw());
 
     loop {
+        terminal_owner.service(pty.as_deref_mut());
         loop_timer.iterations += 1;
         let mut pfds: Vec<libc::pollfd> = vec![libc::pollfd {
             fd: if sock_fd_active { sock_fd } else { -1 },
