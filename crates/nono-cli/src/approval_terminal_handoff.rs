@@ -1,7 +1,7 @@
 //! In-process handoff of worker approvals to the supervisor's terminal owner.
 //! No policy decisions are made here; expiry and unavailable UI fail closed.
 use nix::libc;
-use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
+use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
 use std::cell::RefCell;
 use std::sync::{
     Arc, Mutex,
@@ -20,6 +20,7 @@ struct Context {
     cancelled: Arc<AtomicBool>,
     interrupt: u64,
     child: i32,
+    race: Option<Arc<crate::approval_race::ApprovalRace>>,
 }
 struct Pending {
     request: ApprovalRequest,
@@ -83,6 +84,7 @@ where
         cancelled: Arc::new(AtomicBool::new(false)),
         interrupt: INTERRUPTS.load(Ordering::SeqCst),
         child: 0,
+        race: None,
     };
     let deadline = context.deadline;
     let cancellation = context.cancelled.clone();
@@ -103,7 +105,68 @@ where
 }
 
 pub(crate) fn cancelled() -> bool {
-    CONTEXT.with(|slot| slot.borrow().as_ref().is_some_and(expired))
+    CONTEXT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|context| {
+            expired(context)
+                || context.race.as_ref().is_some_and(|race| {
+                    !matches!(race.poll(), crate::approval_race::RacePoll::Pending)
+                })
+        })
+    })
+}
+
+/// Check the outer approval deadline and supervisor lifecycle without polling
+/// the race itself. `ApprovalRace::wait` calls this while holding its state
+/// lock, so checking the race there would recursively acquire that lock.
+pub(crate) fn context_expired() -> bool {
+    CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|context| expired(context))
+    })
+}
+
+pub(crate) fn active_race() -> Option<Arc<crate::approval_race::ApprovalRace>> {
+    CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|context| context.race.clone())
+    })
+}
+
+pub(crate) fn submit_race_answer(decision: ApprovalDecision) -> Option<ApprovalDecision> {
+    active_race().map(|race| race.answer(decision))
+}
+
+pub(crate) fn with_race_context<T>(
+    race: Arc<crate::approval_race::ApprovalRace>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut context = CONTEXT
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| Context {
+            deadline: race.deadline(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            interrupt: INTERRUPTS.load(Ordering::SeqCst),
+            child: SESSION
+                .lock()
+                .ok()
+                .and_then(|session| session.as_ref().map(|session| session.child))
+                .unwrap_or(0),
+            race: None,
+        });
+    context.deadline = context.deadline.min(race.deadline());
+    context.race = Some(race);
+    let _guard = enter(context);
+    f()
+}
+
+pub(crate) fn is_owner_thread() -> bool {
+    SESSION
+        .lock()
+        .ok()
+        .and_then(|session| session.as_ref().map(|session| session.owner))
+        .is_some_and(|owner| owner == std::thread::current().id())
 }
 fn expired(context: &Context) -> bool {
     if Instant::now() >= context.deadline
@@ -161,6 +224,7 @@ pub(crate) fn request(request: &ApprovalRequest) -> Option<Result<ApprovalDecisi
             cancelled: Arc::new(AtomicBool::new(false)),
             interrupt: INTERRUPTS.load(Ordering::SeqCst),
             child,
+            race: None,
         });
     context.child = child;
     if expired(&context) {
@@ -169,27 +233,56 @@ pub(crate) fn request(request: &ApprovalRequest) -> Option<Result<ApprovalDecisi
     let (reply, receiver) = mpsc::sync_channel(1);
     let deadline = context.deadline;
     let cancelled = context.cancelled.clone();
+    let race = context.race.clone();
     if sender
         .try_send(Pending {
             request: request.clone(),
-            context,
+            context: context.clone(),
             reply,
         })
         .is_err()
     {
-        return Some(Ok(ApprovalDecision::Denied {
-            reason: "Terminal approval queue unavailable".into(),
-        }));
+        return Some(if race.is_some() {
+            Err(NonoError::SandboxInit(
+                "Terminal approval queue unavailable during race".into(),
+            ))
+        } else {
+            Ok(ApprovalDecision::Denied {
+                reason: "Terminal approval queue unavailable".into(),
+            })
+        });
     }
-    Some(
-        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(result) => result,
-            Err(_) => {
-                cancelled.store(true, Ordering::SeqCst);
-                Ok(ApprovalDecision::Timeout)
+    loop {
+        if let Some(race) = &race {
+            match race.poll() {
+                crate::approval_race::RacePoll::Answer(decision)
+                | crate::approval_race::RacePoll::Exhausted(decision) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    return Some(Ok(decision));
+                }
+                crate::approval_race::RacePoll::Expired => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    return Some(Ok(ApprovalDecision::Timeout));
+                }
+                crate::approval_race::RacePoll::Pending => {}
             }
-        },
-    )
+        }
+        if expired(&context) {
+            cancelled.store(true, Ordering::SeqCst);
+            return Some(Ok(ApprovalDecision::Timeout));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(result) => return Some(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancelled.store(true, Ordering::SeqCst);
+                return Some(Err(NonoError::SandboxInit(
+                    "Terminal approval handoff closed".into(),
+                )));
+            }
+        }
+    }
 }
 
 struct RelayGuard<'a>(Option<&'a mut crate::pty_proxy::PtyProxy>);
@@ -215,9 +308,16 @@ impl Owner {
                 if pty.pause_terminal_for_prompt() {
                     RelayGuard(Some(pty))
                 } else {
-                    let _ = pending.reply.send(Ok(ApprovalDecision::Denied {
-                        reason: "No attached terminal for approval".into(),
-                    }));
+                    let result = if pending.context.race.is_some() {
+                        Err(NonoError::SandboxInit(
+                            "No attached terminal for approval race".into(),
+                        ))
+                    } else {
+                        Ok(ApprovalDecision::Denied {
+                            reason: "No attached terminal for approval".into(),
+                        })
+                    };
+                    let _ = pending.reply.send(result);
                     return;
                 }
             }
@@ -328,6 +428,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             interrupt: INTERRUPTS.load(Ordering::SeqCst),
             child: child.id() as i32,
+            race: None,
         };
         let started = Instant::now();
         while !expired(&context) && started.elapsed() < Duration::from_secs(1) {

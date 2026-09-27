@@ -3,7 +3,8 @@
 This document specifies the open contract between `nono` and an HTTP approval
 endpoint. When a policy decision is `approve`, `nono` pauses the sandboxed
 action, asks the endpoint, and applies exactly one of three outcomes: granted,
-denied, or timed out. Timeouts and every error are treated as denial.
+denied, or timed out. Outside the opt-in race mode, timeouts and every error
+are treated as denial.
 
 There are two variants of the contract:
 
@@ -14,6 +15,12 @@ There are two variants of the contract:
   are authenticated with the enrolled key, the tenant is derived server-side,
   and the exchange is submit-then-poll so the server may hold requests durably
   across replicas. Configure with `type: "webhook"` and `auth: "platform"`.
+
+An approval chain may also use the explicit `mode: "race"`. It requires one
+terminal backend and one to three direct non-chain backends. The first explicit
+grant or denial wins; a timeout, error, missing terminal, or unavailable
+terminal is not a human answer. If no responder answers before the race timeout,
+the result is timed out. Existing `all` and `any` chains keep their behavior.
 
 ## Configuration
 
@@ -91,6 +98,18 @@ Accepted spellings for `decision` are `grant`, `granted`, `approve`,
 therefore a denial. A non-`2xx` status is a denial whose reason names the
 status and the elapsed time. The connection stays open until the endpoint
 answers or `timeout_secs` elapses.
+
+When an unsigned webhook is a direct branch of a `race` chain, nono makes a
+best-effort `DELETE` to the same URL after the race resolves or expires. The
+body uses the same `{ "backend": ..., "request": ... }` envelope as the POST.
+The DELETE has a two-second client deadline; its response is ignored and cannot
+change the native decision. An endpoint that implements cancellation should
+remove only the still-pending request matching the full request identity
+(`backend`, `request_id`, `session_id`, and request body/digest), treat duplicate
+cancellation as a no-op, and ignore any late POST result. Cancellation is
+optional cleanup: endpoints that do not implement it may return an error or
+`404`, and the normal timeout remains the fallback. Signed platform webhooks
+are not sent DELETE because that protocol has no signed cancellation operation.
 
 ## Signed variant
 

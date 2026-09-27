@@ -3,6 +3,7 @@
 //! This is the CLI binary that uses the nono library for OS-level sandboxing.
 
 mod app_runtime;
+mod approval_race;
 mod approval_runtime;
 mod approval_terminal_handoff;
 mod audit_attestation;

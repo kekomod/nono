@@ -73,9 +73,10 @@ fn build_approval_backends_from(
     backends: &BTreeMap<String, ApprovalBackendConfig>,
 ) -> Result<BTreeMap<String, Arc<dyn ApprovalBackend>>> {
     let mut built = BTreeMap::new();
+    let mut webhooks = BTreeMap::new();
     let mut visiting = BTreeSet::new();
     for name in backends.keys() {
-        build_approval_backend(name, backends, &mut built, &mut visiting)?;
+        build_approval_backend(name, backends, &mut built, &mut webhooks, &mut visiting)?;
     }
     Ok(built)
 }
@@ -84,6 +85,7 @@ fn build_approval_backend(
     name: &str,
     backends: &BTreeMap<String, ApprovalBackendConfig>,
     built: &mut BTreeMap<String, Arc<dyn ApprovalBackend>>,
+    webhooks: &mut BTreeMap<String, Arc<WebhookApproval>>,
     visiting: &mut BTreeSet<String>,
 ) -> Result<Arc<dyn ApprovalBackend>> {
     if let Some(backend) = built.get(name) {
@@ -102,20 +104,79 @@ fn build_approval_backend(
         ApprovalBackendType::Terminal => Arc::new(NamedTerminalApproval {
             name: name.to_string(),
         }),
-        ApprovalBackendType::Webhook => Arc::new(WebhookApproval::new(name, backend_config)?),
+        ApprovalBackendType::Webhook => {
+            let webhook = Arc::new(WebhookApproval::new(name, backend_config)?);
+            webhooks.insert(name.to_string(), Arc::clone(&webhook));
+            webhook
+        }
         ApprovalBackendType::Chain => {
             let mode = backend_config.mode.ok_or_else(|| {
                 NonoError::ConfigParse(format!("approval backend '{name}' chain missing mode"))
             })?;
             let mut children = Vec::with_capacity(backend_config.backends.len());
             for child in &backend_config.backends {
-                children.push(build_approval_backend(child, backends, built, visiting)?);
+                children.push(build_approval_backend(
+                    child, backends, built, webhooks, visiting,
+                )?);
             }
-            Arc::new(ChainApproval {
-                name: name.to_string(),
-                mode,
-                backends: children,
-            })
+            if mode == ApprovalChainMode::Race {
+                let terminal_indices: Vec<usize> = backend_config
+                    .backends
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, child)| {
+                        backends
+                            .get(child)
+                            .is_some_and(|config| {
+                                config.backend_type == ApprovalBackendType::Terminal
+                            })
+                            .then_some(index)
+                    })
+                    .collect();
+                if terminal_indices.len() != 1
+                    || children.len() < 2
+                    || children.len() > crate::command_policy::MAX_APPROVAL_RACE_BACKENDS
+                {
+                    return Err(NonoError::ConfigParse(format!(
+                        "approval backend '{name}' race requires one terminal backend and one to three other backends"
+                    )));
+                }
+                if backend_config.backends.iter().any(|child| {
+                    backends
+                        .get(child)
+                        .is_some_and(|config| config.backend_type == ApprovalBackendType::Chain)
+                }) {
+                    return Err(NonoError::ConfigParse(format!(
+                        "approval backend '{name}' race cannot contain chained backends"
+                    )));
+                }
+                Arc::new(RaceApproval {
+                    name: name.to_string(),
+                    cancellation_webhooks: backend_config
+                        .backends
+                        .iter()
+                        .filter_map(|child| webhooks.get(child).cloned())
+                        .collect(),
+                    backends: backend_config
+                        .backends
+                        .iter()
+                        .cloned()
+                        .zip(children)
+                        .collect(),
+                    terminal_index: terminal_indices[0],
+                    timeout: Duration::from_secs(
+                        backend_config
+                            .timeout_secs
+                            .unwrap_or(crate::command_policy::APPROVAL_RACE_DEFAULT_TIMEOUT_SECS),
+                    ),
+                })
+            } else {
+                Arc::new(ChainApproval {
+                    name: name.to_string(),
+                    mode,
+                    backends: children,
+                })
+            }
         }
     };
 
@@ -332,6 +393,36 @@ impl WebhookApproval {
         self.parse_response(&response_body)
     }
 
+    /// Best-effort cancellation for a pending unsigned webhook when another
+    /// human responder wins. The detached caller gives this request its own
+    /// short deadline, so transport cleanup never delays native approval.
+    fn cancel_unsigned(&self, request: &ApprovalRequest) {
+        if self.platform.is_some() {
+            return;
+        }
+        let Ok(body) = serde_json::to_vec(&WebhookApprovalRequest {
+            backend: &self.name,
+            request,
+        }) else {
+            return;
+        };
+        let timeout = Duration::from_secs(2);
+        let http = build_agent(timeout);
+        let _ = http
+            .delete(&self.url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .force_send_body()
+            .header("Content-Type", "application/json")
+            .header(
+                "User-Agent",
+                &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .send(&body);
+    }
+
     /// Signed contract (`docs/protocols/approval-webhook-v1.md`): submit, then
     /// poll `GET <url>/{request_id}` with signed requests until a final state
     /// or this backend's timeout. Each hop is given only the remaining budget,
@@ -359,6 +450,9 @@ impl WebhookApproval {
     ) -> Result<ApprovalDecision> {
         let mut submitted = false;
         loop {
+            if crate::approval_terminal_handoff::cancelled() {
+                return Ok(ApprovalDecision::Timeout);
+            }
             let remaining = self.timeout.saturating_sub(elapsed());
             if remaining.is_zero() {
                 return Ok(ApprovalDecision::Timeout);
@@ -513,6 +607,9 @@ impl WebhookApproval {
 
 impl ApprovalBackend for WebhookApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        if crate::approval_terminal_handoff::cancelled() {
+            return Ok(ApprovalDecision::Timeout);
+        }
         let body = serde_json::to_vec(&WebhookApprovalRequest {
             backend: &self.name,
             request,
@@ -546,11 +643,102 @@ struct ChainApproval {
     backends: Vec<Arc<dyn ApprovalBackend>>,
 }
 
+struct RaceApproval {
+    name: String,
+    backends: Vec<(String, Arc<dyn ApprovalBackend>)>,
+    cancellation_webhooks: Vec<Arc<WebhookApproval>>,
+    terminal_index: usize,
+    timeout: Duration,
+}
+
+impl ApprovalBackend for RaceApproval {
+    fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        let race = Arc::new(crate::approval_race::ApprovalRace::new(
+            self.timeout,
+            self.backends.len(),
+        ));
+        let decision =
+            crate::approval_terminal_handoff::with_race_context(Arc::clone(&race), || {
+                let inline_terminal = crate::approval_terminal_handoff::is_owner_thread();
+
+                for (index, (name, backend)) in self.backends.iter().enumerate() {
+                    if inline_terminal && index == self.terminal_index {
+                        continue;
+                    }
+                    let name = name.clone();
+                    let backend = Arc::clone(backend);
+                    let request = request.clone();
+                    let branch_race = Arc::clone(&race);
+                    let branch_name = name.clone();
+                    if std::thread::Builder::new()
+                        .spawn(move || {
+                            let result = crate::approval_terminal_handoff::with_race_context(
+                                Arc::clone(&branch_race),
+                                || backend.request_approval(&request),
+                            );
+                            report_race_result(&branch_race, &name, result);
+                        })
+                        .is_err()
+                    {
+                        race.retire(&branch_name, false);
+                    }
+                }
+
+                if inline_terminal {
+                    let (name, backend) = &self.backends[self.terminal_index];
+                    let result = crate::approval_terminal_handoff::with_race_context(
+                        Arc::clone(&race),
+                        || backend.request_approval(request),
+                    );
+                    report_race_result(&race, name, result);
+                }
+
+                race.wait(crate::approval_terminal_handoff::context_expired)
+            });
+        self.cancel_pending_webhooks(request);
+        Ok(decision)
+    }
+
+    fn backend_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl RaceApproval {
+    fn cancel_pending_webhooks(&self, request: &ApprovalRequest) {
+        for webhook in &self.cancellation_webhooks {
+            let webhook = Arc::clone(webhook);
+            let request = request.clone();
+            let _ = std::thread::Builder::new()
+                .name("nono-approval-cancel".into())
+                .spawn(move || webhook.cancel_unsigned(&request));
+        }
+    }
+}
+
+fn report_race_result(
+    race: &crate::approval_race::ApprovalRace,
+    name: &str,
+    result: Result<ApprovalDecision>,
+) {
+    match result {
+        Ok(ApprovalDecision::Granted) => {
+            race.answer(ApprovalDecision::Granted);
+        }
+        Ok(ApprovalDecision::Denied { reason }) => {
+            race.answer(ApprovalDecision::Denied { reason });
+        }
+        Ok(ApprovalDecision::Timeout) => race.retire(name, true),
+        Err(_) => race.retire(name, false),
+    }
+}
+
 impl ApprovalBackend for ChainApproval {
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
         match self.mode {
             ApprovalChainMode::All => self.request_all(request),
             ApprovalChainMode::Any => Ok(self.request_any(request)),
+            ApprovalChainMode::Race => unreachable!("race mode uses RaceApproval"),
         }
     }
 
@@ -614,6 +802,8 @@ impl ChainApproval {
 mod tests {
     use super::*;
     use sha2::Digest as _;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     struct StaticBackend {
         name: &'static str,
@@ -627,6 +817,18 @@ mod tests {
 
         fn backend_name(&self) -> &str {
             self.name
+        }
+    }
+
+    struct UnavailableBackend;
+
+    impl ApprovalBackend for UnavailableBackend {
+        fn request_approval(&self, _request: &ApprovalRequest) -> Result<ApprovalDecision> {
+            Err(NonoError::SandboxInit("test responder unavailable".into()))
+        }
+
+        fn backend_name(&self) -> &str {
+            "terminal-human"
         }
     }
 
@@ -686,6 +888,90 @@ mod tests {
         };
 
         assert!(chain.request_approval(&request()).unwrap().is_granted());
+    }
+
+    #[test]
+    fn race_keeps_remote_responder_live_when_terminal_is_unavailable() {
+        let race = RaceApproval {
+            name: "human".to_string(),
+            cancellation_webhooks: Vec::new(),
+            backends: vec![
+                ("terminal-human".to_string(), Arc::new(UnavailableBackend)),
+                (
+                    "remote-human".to_string(),
+                    Arc::new(StaticBackend {
+                        name: "remote",
+                        decision: ApprovalDecision::Granted,
+                    }),
+                ),
+            ],
+            terminal_index: 0,
+            timeout: Duration::from_secs(1),
+        };
+
+        assert!(race.request_approval(&request()).unwrap().is_granted());
+    }
+
+    #[test]
+    fn race_keeps_terminal_responder_live_when_remote_fails() {
+        let race = RaceApproval {
+            name: "human".to_string(),
+            cancellation_webhooks: Vec::new(),
+            backends: vec![
+                ("remote-human".to_string(), Arc::new(UnavailableBackend)),
+                (
+                    "terminal-human".to_string(),
+                    Arc::new(StaticBackend {
+                        name: "terminal",
+                        decision: ApprovalDecision::Granted,
+                    }),
+                ),
+            ],
+            terminal_index: 1,
+            timeout: Duration::from_secs(1),
+        };
+
+        assert!(race.request_approval(&request()).unwrap().is_granted());
+    }
+
+    #[test]
+    fn compat_no_tty_race_uses_remote_human_without_terminal_denial() {
+        const CHILD_ENV: &str = "NONO_COMPAT_RACE_APPROVAL_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "approval_runtime::tests::compat_no_tty_race_uses_remote_human_without_terminal_denial",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("isolated no-TTY race test");
+            assert!(status.success());
+            return;
+        }
+        if crate::terminal_prompt::consent_prompt_available() {
+            return;
+        }
+
+        let _owner = crate::approval_terminal_handoff::register(0);
+        let race = RaceApproval {
+            name: "human".to_string(),
+            cancellation_webhooks: Vec::new(),
+            backends: vec![
+                ("terminal-human".to_string(), Arc::new(TerminalApproval)),
+                (
+                    "remote-human".to_string(),
+                    Arc::new(StaticBackend {
+                        name: "remote",
+                        decision: ApprovalDecision::Granted,
+                    }),
+                ),
+            ],
+            terminal_index: 0,
+            timeout: Duration::from_secs(1),
+        };
+
+        assert!(race.request_approval(&request()).unwrap().is_granted());
     }
 
     #[test]
@@ -784,6 +1070,62 @@ mod tests {
                 .unwrap()
                 .is_denied()
         );
+    }
+
+    #[test]
+    fn unsigned_race_cancellation_uses_the_same_request_envelope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let body_start = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                request_bytes.extend_from_slice(&chunk[..count]);
+                if let Some(index) = request_bytes
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request_bytes[..body_start]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            while request_bytes.len() < body_start + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                request_bytes.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            (
+                headers.lines().next().unwrap().to_string(),
+                String::from_utf8(request_bytes[body_start..body_start + content_length].to_vec())
+                    .unwrap(),
+            )
+        });
+
+        let mut backend = test_webhook(Duration::from_secs(1));
+        backend.url = format!("http://{address}/approval");
+        backend.cancel_unsigned(&request());
+        let (request_line, body) = server.join().unwrap();
+        assert!(request_line.starts_with("DELETE /approval HTTP/1.1"));
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["backend"], "security-review");
+        assert_eq!(body["request"]["request_id"], "req-1");
+        assert_eq!(body["request"]["session_id"], "proxy");
     }
 
     fn test_webhook(timeout: Duration) -> WebhookApproval {

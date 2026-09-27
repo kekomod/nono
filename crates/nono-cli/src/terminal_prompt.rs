@@ -1,7 +1,7 @@
 //! Guarded terminal input for security-sensitive line prompts.
 
 use nix::libc;
-use nono::{NonoError, Result};
+use nono::{ApprovalDecision, NonoError, Result};
 use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -18,6 +18,18 @@ pub(crate) fn read_consent_line(prompt: &str) -> Result<String> {
     read_consent_line_from(open_tty()?, prompt, CONSENT_INPUT_DELAY)
 }
 
+pub(crate) enum ConsentInput {
+    Terminal(String),
+    Remote(ApprovalDecision),
+}
+
+pub(crate) fn read_consent_line_racing(
+    prompt: &str,
+    race: &crate::approval_race::ApprovalRace,
+) -> Result<ConsentInput> {
+    read_consent_line_inner(open_tty()?, prompt, CONSENT_INPUT_DELAY, Some(race))
+}
+
 fn open_tty() -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -26,7 +38,19 @@ fn open_tty() -> Result<std::fs::File> {
         .map_err(NonoError::Io)
 }
 
-fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration) -> Result<String> {
+fn read_consent_line_from(tty: std::fs::File, prompt: &str, delay: Duration) -> Result<String> {
+    match read_consent_line_inner(tty, prompt, delay, None)? {
+        ConsentInput::Terminal(line) => Ok(line),
+        ConsentInput::Remote(_) => unreachable!("no remote responder was supplied"),
+    }
+}
+
+fn read_consent_line_inner(
+    mut tty: std::fs::File,
+    prompt: &str,
+    delay: Duration,
+    race: Option<&crate::approval_race::ApprovalRace>,
+) -> Result<ConsentInput> {
     let saved = nix::sys::termios::tcgetattr(&tty).map_err(termios_error)?;
     let restore_tty = tty.try_clone().map_err(NonoError::Io)?;
     let _guard = TermiosRestoreGuard {
@@ -43,11 +67,17 @@ fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration)
     tty.flush().map_err(NonoError::Io)?;
     let enables = std::time::Instant::now() + delay;
     while std::time::Instant::now() < enables {
+        if let Some(input) = race.and_then(|race| take_remote_answer(&mut tty, race)) {
+            return Ok(input);
+        }
         check_cancelled()?;
         std::thread::sleep(
             Duration::from_millis(20)
                 .min(enables.saturating_duration_since(std::time::Instant::now())),
         );
+    }
+    if let Some(input) = race.and_then(|race| take_remote_answer(&mut tty, race)) {
+        return Ok(input);
     }
     check_cancelled()?;
 
@@ -58,6 +88,9 @@ fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration)
 
     let mut input = Vec::new();
     loop {
+        if let Some(input) = race.and_then(|race| take_remote_answer(&mut tty, race)) {
+            return Ok(input);
+        }
         check_cancelled()?;
         // select supports the macOS controlling-terminal device, which rejects poll.
         let fd = tty.as_raw_fd();
@@ -94,6 +127,9 @@ fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration)
         if ready == 0 {
             continue;
         }
+        if let Some(input) = race.and_then(|race| take_remote_answer(&mut tty, race)) {
+            return Ok(input);
+        }
         check_cancelled()?;
         let mut byte = [0];
         if tty.read(&mut byte).map_err(NonoError::Io)? == 0 {
@@ -110,8 +146,33 @@ fn read_consent_line_from(mut tty: std::fs::File, prompt: &str, delay: Duration)
             )));
         }
     }
+    if let Some(input) = race.and_then(|race| take_remote_answer(&mut tty, race)) {
+        return Ok(input);
+    }
     check_cancelled()?;
-    Ok(String::from_utf8_lossy(&input).into_owned())
+    Ok(ConsentInput::Terminal(
+        String::from_utf8_lossy(&input).into_owned(),
+    ))
+}
+
+fn race_answer(race: &crate::approval_race::ApprovalRace) -> Option<ApprovalDecision> {
+    match race.poll() {
+        crate::approval_race::RacePoll::Answer(decision)
+        | crate::approval_race::RacePoll::Exhausted(decision) => Some(decision),
+        crate::approval_race::RacePoll::Expired => Some(ApprovalDecision::Timeout),
+        crate::approval_race::RacePoll::Pending => None,
+    }
+}
+
+fn take_remote_answer(
+    tty: &mut std::fs::File,
+    race: &crate::approval_race::ApprovalRace,
+) -> Option<ConsentInput> {
+    let decision = race_answer(race)?;
+    let _ = nix::sys::termios::tcflush(&mut *tty, nix::sys::termios::FlushArg::TCIFLUSH);
+    let _ = write!(tty, "\r\x1b[2K");
+    let _ = tty.flush();
+    Some(ConsentInput::Remote(decision))
 }
 
 fn check_cancelled() -> Result<()> {
