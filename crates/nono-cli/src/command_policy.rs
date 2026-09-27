@@ -16,6 +16,9 @@ use std::path::Path;
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
+pub(crate) const APPROVAL_RACE_DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub(crate) const MAX_APPROVAL_RACE_BACKENDS: usize = 4;
+
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
@@ -399,6 +402,9 @@ pub enum ApprovalBackendType {
 pub enum ApprovalChainMode {
     All,
     Any,
+    /// Race direct backends and apply the first explicit human decision.
+    /// Validation requires one terminal backend and one to three other leaves.
+    Race,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2249,6 +2255,75 @@ fn validate_approval_backend(
                             "approval backend '{name}' references unknown backend '{child_backend}'"
                         ),
                     );
+                }
+            }
+            if backend.mode == Some(ApprovalChainMode::Race) {
+                if backend.backends.len() < 2 {
+                    report.error(
+                        "invalid_approval_backend",
+                        format!(
+                            "approval backend '{name}' race mode must define at least two backends"
+                        ),
+                    );
+                }
+                if backend.backends.len() > MAX_APPROVAL_RACE_BACKENDS {
+                    report.error(
+                        "invalid_approval_backend",
+                        format!(
+                            "approval backend '{name}' race mode cannot define more than {MAX_APPROVAL_RACE_BACKENDS} backends"
+                        ),
+                    );
+                }
+                let race_timeout = backend
+                    .timeout_secs
+                    .unwrap_or(APPROVAL_RACE_DEFAULT_TIMEOUT_SECS);
+                if race_timeout > 86_400 {
+                    report.error(
+                        "invalid_approval_backend",
+                        format!("approval backend '{name}' race timeout_secs cannot exceed 86400"),
+                    );
+                }
+                let terminal_count = backend
+                    .backends
+                    .iter()
+                    .filter(|child| {
+                        backends.get(*child).is_some_and(|child| {
+                            child.backend_type == ApprovalBackendType::Terminal
+                        })
+                    })
+                    .count();
+                if terminal_count != 1 {
+                    report.error(
+                        "invalid_approval_backend",
+                        format!(
+                            "approval backend '{name}' race mode must contain exactly one terminal backend"
+                        ),
+                    );
+                }
+                if backend.backends.iter().any(|child| {
+                    backends
+                        .get(child)
+                        .is_some_and(|child| child.backend_type == ApprovalBackendType::Chain)
+                }) {
+                    report.error(
+                        "invalid_approval_backend",
+                        format!(
+                            "approval backend '{name}' race mode cannot contain chained backends"
+                        ),
+                    );
+                }
+                for child_name in &backend.backends {
+                    if let Some(child) = backends.get(child_name)
+                        && child.backend_type == ApprovalBackendType::Webhook
+                        && child.timeout_secs.unwrap_or(60) > race_timeout
+                    {
+                        report.error(
+                            "invalid_approval_backend",
+                            format!(
+                                "approval backend '{name}' race timeout must cover webhook backend '{child_name}' timeout"
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -6170,6 +6245,69 @@ mod tests {
             timeout_secs: None,
         };
         assert!(validate_security_approval_backends(&backends, Some(&defaults)).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_accepts_opt_in_terminal_race() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "terminal-human".to_string(),
+            security_backend(ApprovalBackendType::Terminal),
+        );
+        backends.insert(
+            "remote-human".to_string(),
+            ApprovalBackendConfig {
+                url: Some("http://127.0.0.1:7684/approval".to_string()),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        backends.insert(
+            "human".to_string(),
+            ApprovalBackendConfig {
+                mode: Some(ApprovalChainMode::Race),
+                backends: vec!["remote-human".to_string(), "terminal-human".to_string()],
+                ..security_backend(ApprovalBackendType::Chain)
+            },
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("human".to_string()),
+            timeout_secs: None,
+        };
+
+        assert!(validate_security_approval_backends(&backends, Some(&defaults)).is_ok());
+    }
+
+    #[test]
+    fn security_approval_race_requires_a_terminal_and_direct_backends() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "remote-human".to_string(),
+            ApprovalBackendConfig {
+                url: Some("http://127.0.0.1:7684/approval".to_string()),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        backends.insert(
+            "human".to_string(),
+            ApprovalBackendConfig {
+                mode: Some(ApprovalChainMode::Race),
+                backends: vec!["remote-human".to_string()],
+                ..security_backend(ApprovalBackendType::Chain)
+            },
+        );
+
+        let err = validate_security_approval_backends(&backends, None)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("at least two backends"), "{err}");
+        assert!(err.contains("exactly one terminal backend"), "{err}");
+    }
+
+    #[test]
+    fn approval_chain_mode_race_parses_from_native_profile_config() {
+        let mode: ApprovalChainMode = serde_json::from_str("\"race\"").expect("race mode");
+        assert_eq!(mode, ApprovalChainMode::Race);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! additional filesystem access. This is the default approval backend
 //! for `nono run`.
 
-use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, Result};
+use nono::{AccessMode, ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
 
 /// Interactive terminal approval backend.
 ///
@@ -19,12 +19,28 @@ impl ApprovalBackend for TerminalApproval {
         if let Some(result) = crate::approval_terminal_handoff::request(request) {
             return result;
         }
+        let race = crate::approval_terminal_handoff::active_race();
+        if let Some(race) = &race {
+            match race.poll() {
+                crate::approval_race::RacePoll::Answer(decision)
+                | crate::approval_race::RacePoll::Exhausted(decision) => return Ok(decision),
+                crate::approval_race::RacePoll::Expired => {
+                    return Ok(ApprovalDecision::Timeout);
+                }
+                crate::approval_race::RacePoll::Pending => {}
+            }
+        }
         if crate::approval_terminal_handoff::cancelled() {
             return Ok(ApprovalDecision::Timeout);
         }
         // Check the controlling terminal itself, in the same read/write mode
         // used to prompt, so we don't print a prompt we cannot safely answer.
         if !crate::terminal_prompt::consent_prompt_available() {
+            if race.is_some() {
+                return Err(NonoError::SandboxInit(
+                    "No terminal available for approval race".into(),
+                ));
+            }
             return Ok(ApprovalDecision::Denied {
                 reason: "No terminal available for interactive approval".to_string(),
             });
@@ -111,16 +127,46 @@ impl ApprovalBackend for TerminalApproval {
             }
         }
         eprintln!("[nono]");
-        let input = crate::terminal_prompt::read_consent_line("[nono] Grant access? [y/N] ")?;
-
-        if is_affirmative_response(&input) {
-            eprintln!("[nono] Access granted.");
-            Ok(ApprovalDecision::Granted)
+        let input = match &race {
+            Some(race) => crate::terminal_prompt::read_consent_line_racing(
+                "[nono] Grant access? [y/N] ",
+                race,
+            )?,
+            None => crate::terminal_prompt::ConsentInput::Terminal(
+                crate::terminal_prompt::read_consent_line("[nono] Grant access? [y/N] ")?,
+            ),
+        };
+        let decision = match input {
+            crate::terminal_prompt::ConsentInput::Remote(decision) => {
+                match &decision {
+                    ApprovalDecision::Granted => eprintln!("[nono] Access granted remotely."),
+                    ApprovalDecision::Denied { .. } => {
+                        eprintln!("[nono] Access denied remotely.")
+                    }
+                    ApprovalDecision::Timeout => eprintln!("[nono] Approval timed out."),
+                }
+                decision
+            }
+            crate::terminal_prompt::ConsentInput::Terminal(input)
+                if is_affirmative_response(&input) =>
+            {
+                eprintln!("[nono] Access granted.");
+                ApprovalDecision::Granted
+            }
+            crate::terminal_prompt::ConsentInput::Terminal(_) => {
+                eprintln!("[nono] Access denied.");
+                ApprovalDecision::Denied {
+                    reason: "User denied the request".to_string(),
+                }
+            }
+        };
+        if race.is_some() {
+            Ok(
+                crate::approval_terminal_handoff::submit_race_answer(decision.clone())
+                    .unwrap_or(decision),
+            )
         } else {
-            eprintln!("[nono] Access denied.");
-            Ok(ApprovalDecision::Denied {
-                reason: "User denied the request".to_string(),
-            })
+            Ok(decision)
         }
     }
 
@@ -289,6 +335,41 @@ mod tests {
             decision.is_denied(),
             "expected Denied when stderr is not a terminal"
         );
+    }
+
+    #[test]
+    fn compat_no_tty_is_unavailable_during_race_not_a_user_denial() {
+        const CHILD_ENV: &str = "NONO_COMPAT_RACE_NO_TTY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "terminal_approval::tests::compat_no_tty_is_unavailable_during_race_not_a_user_denial",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("isolated terminal race test");
+            assert!(status.success());
+            return;
+        }
+        if crate::terminal_prompt::consent_prompt_available() {
+            return;
+        }
+
+        let _owner = crate::approval_terminal_handoff::register(0);
+        let race = std::sync::Arc::new(crate::approval_race::ApprovalRace::new(
+            std::time::Duration::from_secs(1),
+            2,
+        ));
+        let result = crate::approval_terminal_handoff::with_race_context(
+            std::sync::Arc::clone(&race),
+            || TerminalApproval.request_approval(&capability_request()),
+        );
+        assert!(result.is_err(), "absence of TTY is not a human denial");
+        assert!(matches!(
+            race.poll(),
+            crate::approval_race::RacePoll::Pending
+        ));
     }
 
     #[test]
