@@ -350,6 +350,19 @@ impl WebhookApproval {
         }
     }
 
+    /// A non-success status remains fail-closed for ordinary webhook policies.
+    /// In a human race it only makes this responder unavailable; an explicit
+    /// 2xx denial is still the branch's human answer.
+    fn http_status_result(&self, status: u16, elapsed: Duration) -> Result<ApprovalDecision> {
+        if crate::approval_terminal_handoff::active_race().is_some() {
+            return Err(NonoError::SandboxInit(format!(
+                "approval webhook '{}' returned HTTP {status} during an approval race",
+                self.name
+            )));
+        }
+        Ok(self.http_status_denial(status, elapsed))
+    }
+
     fn read_body(&self, response: &mut ureq::http::Response<ureq::Body>) -> Result<String> {
         response
             .body_mut()
@@ -388,7 +401,7 @@ impl WebhookApproval {
         let status = response.status().as_u16();
         let response_body = self.read_body(&mut response)?;
         if !(200..300).contains(&status) {
-            return Ok(self.http_status_denial(status, started.elapsed()));
+            return self.http_status_result(status, started.elapsed());
         }
         self.parse_response(&response_body)
     }
@@ -471,7 +484,7 @@ impl WebhookApproval {
                 return Ok(ApprovalDecision::Timeout);
             }
             if !(200..300).contains(&reply.status) {
-                return Ok(self.http_status_denial(reply.status, elapsed_after_reply));
+                return self.http_status_result(reply.status, elapsed_after_reply);
             }
             let status: PlatformApprovalStatus =
                 serde_json::from_str(&reply.body).map_err(|e| {
@@ -1137,6 +1150,109 @@ mod tests {
             platform: None,
             poll_backoff: Duration::ZERO,
         }
+    }
+
+    fn local_status_webhook(status: u16) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let body_start = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..body_start]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            while bytes.len() < body_start + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let (reason, body) = match status {
+                503 => ("Service Unavailable", "unavailable"),
+                _ => ("Fixture Status", "fixture"),
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/approval"), server)
+    }
+
+    #[test]
+    fn unsigned_http_status_retires_only_a_race_branch() {
+        let race = Arc::new(crate::approval_race::ApprovalRace::new(
+            Duration::from_secs(1),
+            2,
+        ));
+        let (url, server) = local_status_webhook(503);
+        let mut backend = test_webhook(Duration::from_secs(1));
+        backend.url = url;
+        let result = crate::approval_terminal_handoff::with_race_context(Arc::clone(&race), || {
+            backend.request_approval(&request())
+        });
+        server.join().unwrap();
+
+        report_race_result(&race, "remote-human", result);
+        assert!(matches!(
+            race.poll(),
+            crate::approval_race::RacePoll::Pending
+        ));
+        assert!(race.answer(ApprovalDecision::Granted).is_granted());
+    }
+
+    #[test]
+    fn ordinary_unsigned_http_status_remains_a_denial() {
+        let (url, server) = local_status_webhook(503);
+        let mut backend = test_webhook(Duration::from_secs(1));
+        backend.url = url;
+
+        let result = backend.request_approval(&request()).unwrap();
+        server.join().unwrap();
+        match result {
+            ApprovalDecision::Denied { reason } => assert!(reason.contains("HTTP 503")),
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_http_status_retires_only_a_race_branch() {
+        let race = Arc::new(crate::approval_race::ApprovalRace::new(
+            Duration::from_secs(1),
+            2,
+        ));
+        let backend = test_webhook(Duration::from_secs(1));
+        let result = crate::approval_terminal_handoff::with_race_context(Arc::clone(&race), || {
+            backend.drive_platform_approval("req-1", b"{}", Instant::now(), |_, _| {
+                Ok(reply(503, "unavailable"))
+            })
+        });
+
+        report_race_result(&race, "remote-human", result);
+        assert!(matches!(
+            race.poll(),
+            crate::approval_race::RacePoll::Pending
+        ));
+        assert!(race.answer(ApprovalDecision::Granted).is_granted());
     }
 
     fn reply(status: u16, body: &str) -> HttpReply {
