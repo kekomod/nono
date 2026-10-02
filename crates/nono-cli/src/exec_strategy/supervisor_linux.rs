@@ -679,6 +679,17 @@ pub(super) enum NetworkDecision {
     Deny,
 }
 
+/// Consume the reporting budget only for a policy denial.
+fn try_acquire_network_denial_report_token(
+    decision: NetworkDecision,
+    rate_limiter: &mut RateLimiter,
+) -> Option<bool> {
+    match decision {
+        NetworkDecision::Allow => None,
+        NetworkDecision::Deny => Some(rate_limiter.try_acquire()),
+    }
+}
+
 /// Whether a trapped network syscall on address `family` carries no policy
 /// decision under `policy`, so the supervisor must resume it untouched.
 ///
@@ -1217,26 +1228,26 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
-            NetworkDecision::Allow => {}
+        let decision = decide_network_notification(notif.pid, notif.data.nr, sockaddr, config);
+        let report_token = match decision {
+            NetworkDecision::Allow => {
+                try_acquire_network_denial_report_token(decision, rate_limiter)
+            }
             NetworkDecision::Deny => {
                 // Policy is authoritative even when the reporting budget is empty.
-                // Allowed traffic must never spend the approval-prompt budget (#1420).
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-                if rate_limiter.try_acquire() {
-                    record_af_unix_ipc_denial(
-                        sockaddr,
-                        notif.pid,
-                        notif.data.nr,
-                        denials,
-                        ipc_denials,
-                    );
-                    if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
-                        warn!("Failed to record network denial audit event: {}", err);
-                    }
-                }
-                return Ok(());
+                try_acquire_network_denial_report_token(decision, rate_limiter)
             }
+        };
+        if let Some(report_denial) = report_token {
+            if report_denial {
+                // Allowed traffic never spends the approval-prompt budget (#1420).
+                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
+                    warn!("Failed to record network denial audit event: {}", err);
+                }
+            }
+            return Ok(());
         }
     }
 
@@ -1547,6 +1558,25 @@ mod tests {
             assert!(limiter.try_acquire());
         }
         assert!(!limiter.try_acquire());
+    }
+
+    #[test]
+    fn permitted_network_burst_preserves_denial_report_budget() {
+        let mut limiter = RateLimiter::new(0, 1);
+        for _ in 0..100 {
+            assert_eq!(
+                try_acquire_network_denial_report_token(NetworkDecision::Allow, &mut limiter),
+                None
+            );
+        }
+        assert_eq!(
+            try_acquire_network_denial_report_token(NetworkDecision::Deny, &mut limiter),
+            Some(true)
+        );
+        assert_eq!(
+            try_acquire_network_denial_report_token(NetworkDecision::Deny, &mut limiter),
+            Some(false)
+        );
     }
 
     #[test]
